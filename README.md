@@ -1,16 +1,31 @@
-# Trading bot starter (paper trading only)
+# Trading bot for both MT5 and crypto markets
 
-A Python/MetaTrader 5 market scanner that evaluates an explicit symbol allowlist, filters on spread and recent tick volume, estimates buyer/seller pressure from ticks (and optionally MT5 market depth), calculates ATR-based stop-loss/take-profit levels, sizes simulated positions from a risk budget, and manages paper trades.
+This project is a market scanner and paper-trading bot designed for two sources:
 
-**This project does not submit live orders.** It defaults to paper trading and contains no live-order execution path. Market-depth availability, tick flags, and symbol naming vary by broker. Tick buy/sell flags are only a rough flow proxy—not actual exchange-wide order flow or a prediction.
+- MetaTrader 5 (forex/indices/CFDs)
+- Binance spot markets (crypto)
+
+It evaluates a configurable market allowlist, checks spread and liquidity, scores buyer/seller pressure from tick flow or order-book depth, then computes a position using a risk budget and a stop-loss / take-profit plan. The default mode is paper trading; live execution is disabled unless you explicitly turn it on.
+
+## Features
+
+- Supports both MetaTrader 5 and Binance
+- Allows multiple symbols from both markets in the same config
+- Checks spread, volume, and liquidity before entering a trade
+- Uses order-book pressure or tick imbalance as a buyer/seller signal
+- Sizes positions from account risk, not a fixed lot size
+- Uses stop-loss and reward/risk logic
+- Stores paper-trade state locally
+- Logs decisions to `bot.log` and `trades.csv`
 
 ## Requirements
 
 - Python 3.10+
-- Windows with the MetaTrader 5 desktop terminal installed and logged into a demo account (or configured credentials in environment variables)
-- A broker that exposes the configured symbols and, optionally, market depth
+- Windows + MetaTrader 5 terminal for MT5 trading
+- Internet access for Binance REST market data
+- Demo account recommended for testing
 
-## Setup
+## Install
 
 ```powershell
 py -m venv .venv
@@ -20,19 +35,63 @@ Copy-Item config.example.yaml config.yaml
 python bot.py --config config.yaml
 ```
 
-The terminal may already be logged in. To initialize MT5 explicitly, set `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER` in the process environment. Never commit real credentials. `MT5_PATH` can optionally point to the terminal executable.
+## Configuration
 
-## Configure
+Use `config.example.yaml` as a reference.
 
-Edit `config.yaml`. `symbols` is an allowlist; use the exact names shown by your broker (for example, `BTCUSD` or `BTCUSDm`). Tune thresholds using historical/demo data. `paper.starting_balance` and `risk_per_trade_pct` affect only the simulator. The bot refuses to run if `paper.enabled` is false.
+Example:
 
-Market-depth checks are best-effort: when enabled, the bot requests the book and applies the configured minimum depth if the broker provides it. If depth is unavailable, the configured `require_market_depth` setting determines whether that symbol is skipped. Tick volume and buy/sell tick imbalance are not equivalent to centralized volume or an order book.
+```yaml
+paper:
+  enabled: true
+  starting_balance: 10000.0
+  risk_per_trade_pct: 0.5
+  max_daily_loss_pct: 2.0
+  max_open_positions: 3
+  state_file: paper_state.json
 
-Paper positions and balance are saved to `paper_state.json`; decisions are appended to `bot.log` and `trades.csv`. These files are local runtime data and ignored by Git. Paper execution does not model slippage, commissions, funding, or guaranteed fills.
+live:
+  enabled: false
+  api_base: https://api.binance.com
 
-## Risk and safety
+markets:
+  - type: mt5
+    enabled: true
+    symbol: EURUSD
+    timeframe: M15
+    min_spread_points: 1500
+    min_tick_volume: 10
+    min_liquidity_score: 0.15
+    trend_fast_ema: 12
+    trend_slow_ema: 26
+    atr_period: 14
+    stop_atr_multiple: 2.0
+    reward_risk_ratio: 1.5
 
-- Paper-only; there is no real-order endpoint or live-trading switch.
-- Symbol allowlist, spread and volume gates, configurable ATR stops/targets, risk-based sizing, maximum open positions, and daily loss cutoff.
-- Stops can gap in real markets; simulated outcomes are not live performance.
-- Test on a demo terminal and review the configuration before relying on any output. This software is educational and does not provide financial advice or guarantee results.
+  - type: binance
+    enabled: true
+    symbol: BTCUSDT
+    interval: 15m
+    min_spread_pct: 0.0008
+    min_volume_usd: 500000
+    min_book_liquidity: 0.15
+    trend_fast_ema: 12
+    trend_slow_ema: 26
+    atr_period: 14
+    stop_atr_multiple: 2.0
+    reward_risk_ratio: 1.5
+```
+
+## Safety
+
+- Live trading is disabled by default.
+- The bot does not submit real orders until you explicitly enable a live path.
+- Paper trading is meant for testing and learning only.
+- Spread, book pressure, and volume are proxies; they cannot guarantee winning trades.
+- Never commit real account credentials. Store them in environment variables or a local secrets file.
+
+## Files produced
+
+- `bot.log` – runtime logs
+- `trades.csv` – trade history
+- `paper_state.json` – paper-trading state

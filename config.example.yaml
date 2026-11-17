@@ -1,30 +1,38 @@
-# Copy to config.yaml and adjust for your broker's exact symbol names.
 paper:
   enabled: true
   starting_balance: 10000.0
   risk_per_trade_pct: 0.5
-  max_open_positions: 3
   max_daily_loss_pct: 2.0
+  max_open_positions: 3
   state_file: paper_state.json
 
-mt5:
-  timeout_ms: 10000
-  market_depth_enabled: true
-  require_market_depth: false
+live:
+  enabled: false
+  api_base: https://api.binance.com
 
-scanner:
-  timeframe: M15
-  bars: 250
-  poll_seconds: 30
-  symbols:
-    - BTCUSD
-    - ETHUSD
-  min_tick_volume: 10
-  max_spread_points: 1500
-  min_depth_volume: 0.0
-  min_buy_sell_imbalance: 0.10
-  ema_fast: 12
-  ema_slow: 26
-  atr_period: 14
-  stop_atr_multiple: 2.0
-  reward_risk_ratio: 1.5
+markets:
+  - type: mt5
+    enabled: true
+    symbol: EURUSD
+    timeframe: M15
+    min_spread_points: 1500
+    min_tick_volume: 10
+    min_liquidity_score: 0.15
+    trend_fast_ema: 12
+    trend_slow_ema: 26
+    atr_period: 14
+    stop_atr_multiple: 2.0
+    reward_risk_ratio: 1.5
+
+  - type: binance
+    enabled: true
+    symbol: BTCUSDT
+    interval: 15m
+    min_spread_pct: 0.0008
+    min_volume_usd: 500000
+    min_book_liquidity: 0.15
+    trend_fast_ema: 12
+    trend_slow_ema: 26
+    atr_period: 14
+    stop_atr_multiple: 2.0
+    reward_risk_ratio: 1.5
