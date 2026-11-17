@@ -1,358 +1,214 @@
-"""Paper-trading MT5 market scanner. No live order execution is implemented."""
+"""Paper-trading market scanner for MT5 and Binance. No real orders are submitted."""
 from __future__ import annotations
-
-import argparse
-import json
-import logging
-import math
-import os
-import signal
-import sys
-import time
-from dataclasses import asdict, dataclass
+import argparse, csv, json, logging, os, signal, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
 import pandas as pd
+import requests
 import yaml
-
+from core import RiskEngine, RiskLimits, backtest, indicators
 try:
     import MetaTrader5 as mt5
 except ImportError:
     mt5 = None
-
-TIMEFRAMES = {
-    "M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15",
-    "M30": "TIMEFRAME_M30", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4",
-    "D1": "TIMEFRAME_D1",
-}
 STOP = False
+BASE = "https://api.binance.com"
+TF = {"M1":"TIMEFRAME_M1", "M5":"TIMEFRAME_M5", "M15":"TIMEFRAME_M15", "M30":"TIMEFRAME_M30", "H1":"TIMEFRAME_H1", "H4":"TIMEFRAME_H4", "D1":"TIMEFRAME_D1"}
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
-    )
-
-
-def load_config(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    paper = cfg.get("paper", {})
-    if paper.get("enabled") is not True:
-        raise ValueError("Paper mode must be enabled. This application does not support live orders.")
-    if not paper.get("starting_balance", 0) > 0:
-        raise ValueError("paper.starting_balance must be positive")
-    if not 0 < paper.get("risk_per_trade_pct", 0) <= 2:
-        raise ValueError("risk_per_trade_pct must be > 0 and <= 2 percent")
-    scanner = cfg.get("scanner", {})
-    symbols = scanner.get("symbols", [])
-    if not symbols or len(set(symbols)) != len(symbols):
-        raise ValueError("Configure a non-empty, duplicate-free scanner.symbols allowlist")
-    if scanner.get("ema_fast", 0) >= scanner.get("ema_slow", 0):
-        raise ValueError("ema_fast must be smaller than ema_slow")
-    if scanner.get("stop_atr_multiple", 0) <= 0 or scanner.get("reward_risk_ratio", 0) <= 0:
-        raise ValueError("ATR stop and reward/risk values must be positive")
+def now(): return datetime.now(timezone.utc)
+def log_setup(): logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")])
+def load_config(path):
+    with open(path, encoding="utf-8") as f: cfg=yaml.safe_load(f) or {}
+    paper=cfg.get("paper", {})
+    if paper.get("enabled") is not True: raise ValueError("Paper mode must stay enabled; live execution is not implemented")
+    if not paper.get("starting_balance", 0)>0: raise ValueError("paper.starting_balance must be positive")
+    risk=paper.get("risk_per_trade_pct", 0)
+    if not 0<risk<=1: raise ValueError("risk_per_trade_pct must be > 0 and <= 1")
+    markets=cfg.get("markets", [])
+    if not any(m.get("enabled") is True for m in markets): raise ValueError("Enable at least one reviewed market in config.yaml")
+    if any(m.get("type") not in {"mt5","binance"} for m in markets): raise ValueError("Market type must be mt5 or binance")
     return cfg
 
+def append_csv(path, row):
+    p=Path(path); exists=p.exists()
+    with p.open("a", newline="", encoding="utf-8") as f:
+        w=csv.DictWriter(f, fieldnames=list(row));
+        if not exists: w.writeheader()
+        w.writerow(row)
 
-def init_mt5(cfg: dict[str, Any]) -> None:
-    if mt5 is None:
-        raise RuntimeError("MetaTrader5 package missing; run pip install -r requirements.txt")
-    options: dict[str, Any] = {"timeout": int(cfg.get("mt5", {}).get("timeout_ms", 10000))}
-    terminal_path = os.getenv("MT5_PATH")
-    if terminal_path:
-        options["path"] = terminal_path
-    login, password, server = (os.getenv(k) for k in ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER"))
-    if login and password and server:
-        options.update(login=int(login), password=password, server=server)
-    if not mt5.initialize(**options):
-        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
-    account = mt5.account_info()
-    if account is None:
-        raise RuntimeError(f"MT5 account info unavailable: {mt5.last_error()}")
-    logging.info("Connected to MT5 account %s on %s; only paper trades will be made", account.login, account.server)
+def init_mt5(cfg):
+    if mt5 is None: raise RuntimeError("Install MetaTrader5 on Windows and start/login to the MT5 terminal")
+    opts={"timeout":int(cfg.get("mt5",{}).get("timeout_ms",10000))}
+    if os.getenv("MT5_PATH"): opts["path"]=os.getenv("MT5_PATH")
+    if os.getenv("MT5_LOGIN") and os.getenv("MT5_PASSWORD") and os.getenv("MT5_SERVER"):
+        opts.update(login=int(os.environ["MT5_LOGIN"]), password=os.environ["MT5_PASSWORD"], server=os.environ["MT5_SERVER"])
+    if not mt5.initialize(**opts): raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
 
+def binance_candles(symbol, interval, limit=500):
+    r=requests.get(BASE+"/api/v3/klines", params={"symbol":symbol,"interval":interval,"limit":limit}, timeout=15); r.raise_for_status()
+    return pd.DataFrame(r.json(),columns=["time","open","high","low","close","volume","close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]).assign(**{}) .pipe(_numeric)
+def _numeric(df):
+    for c in ["open","high","low","close","volume","quote_volume","taker_buy_base","taker_buy_quote"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+    return df
 
-def rates_frame(symbol: str, scanner: dict[str, Any]) -> tuple[pd.DataFrame, Any, Any] | None:
-    timeframe_name = str(scanner.get("timeframe", "M15")).upper()
-    timeframe_const = TIMEFRAMES.get(timeframe_name)
-    if timeframe_const is None:
-        raise ValueError(f"Unsupported timeframe: {timeframe_name}")
-    timeframe = getattr(mt5, timeframe_const)
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, int(scanner.get("bars", 250)))
-    info = mt5.symbol_info(symbol)
-    tick = mt5.symbol_info_tick(symbol)
-    if rates is None or len(rates) < max(int(scanner["ema_slow"]), int(scanner["atr_period"])) + 3 or info is None or tick is None:
-        logging.warning("%s: insufficient price/symbol data", symbol)
-        return None
-    frame = pd.DataFrame(rates)
-    return frame, info, tick
+def fetch_binance(m):
+    df=binance_candles(m["symbol"],m.get("interval","15m"),250)
+    if len(df)<40: return None
+    # Ignore the still-forming last candle.
+    df=df.iloc[:-1].reset_index(drop=True)
+    book=requests.get(BASE+"/api/v3/depth",params={"symbol":m["symbol"],"limit":20},timeout=10); book.raise_for_status(); book=book.json()
+    ticker=requests.get(BASE+"/api/v3/ticker/24hr",params={"symbol":m["symbol"]},timeout=10); ticker.raise_for_status(); ticker=ticker.json()
+    bids,asks=book.get("bids",[]),book.get("asks",[])
+    bidq=sum(float(x[1]) for x in bids[:10]); askq=sum(float(x[1]) for x in asks[:10]); total=bidq+askq
+    flow=(bidq-askq)/total if total else None
+    spread=(float(asks[0][0])-float(bids[0][0]))/max(float(bids[0][0]),1e-12) if asks and bids else float("inf")
+    enriched=indicators(df,int(m.get("trend_fast_ema",12)),int(m.get("trend_slow_ema",26)),int(m.get("atr_period",14)))
+    return {"df":enriched,"price":float(ticker["lastPrice"]),"spread":spread,"volume_usd":float(ticker.get("quoteVolume",0)),"flow":flow,"liquidity":bidq+askq,"details":{"bid":float(bids[0][0]),"ask":float(asks[0][0])} if bids and asks else {}}
 
-
-def indicators(frame: pd.DataFrame, scanner: dict[str, Any]) -> dict[str, float]:
-    close = frame["close"].astype(float)
-    fast = close.ewm(span=int(scanner["ema_fast"]), adjust=False).mean()
-    slow = close.ewm(span=int(scanner["ema_slow"]), adjust=False).mean()
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (frame["high"] - frame["low"]).abs(),
-        (frame["high"] - prev_close).abs(),
-        (frame["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(int(scanner["atr_period"])).mean().iloc[-1]
-    return {"fast": float(fast.iloc[-1]), "slow": float(slow.iloc[-1]), "atr": float(atr), "close": float(close.iloc[-1])}
-
-
-def tick_flow(symbol: str, cfg: dict[str, Any]) -> tuple[float | None, float]:
-    """Returns signed buy/sell tick imbalance (-1..1), and optional book total volume."""
-    imbalance: float | None = None
-    depth_total = 0.0
-    if cfg.get("mt5", {}).get("market_depth_enabled", True):
-        try:
-            if mt5.market_book_add(symbol):
-                book = mt5.market_book_get(symbol) or []
-                bids = sum(float(x.volume) for x in book if x.type == mt5.BOOK_TYPE_BUY)
-                asks = sum(float(x.volume) for x in book if x.type == mt5.BOOK_TYPE_SELL)
-                depth_total = bids + asks
-                if depth_total > 0:
-                    imbalance = (bids - asks) / depth_total
-                mt5.market_book_release(symbol)
-        except Exception as exc:
-            logging.debug("%s: market depth unavailable: %s", symbol, exc)
-    # Tick flags may be broker-dependent. Treat unknown flags as neutral rather than inferring direction.
+def fetch_mt5(m):
+    if not mt5.symbol_select(m["symbol"],True): return None
+    key=str(m.get("timeframe","M15")).upper()
+    if key not in TF: raise ValueError(f"Unsupported MT5 timeframe: {key}")
+    rates=mt5.copy_rates_from_pos(m["symbol"],getattr(mt5,TF[key]),0,int(m.get("bars",300)))
+    info=mt5.symbol_info(m["symbol"]); tick=mt5.symbol_info_tick(m["symbol"])
+    if rates is None or info is None or tick is None or len(rates)<40: return None
+    df=pd.DataFrame(rates).iloc[:-1].reset_index(drop=True)
+    enriched=indicators(df,int(m.get("trend_fast_ema",12)),int(m.get("trend_slow_ema",26)),int(m.get("atr_period",14)))
+    spread=(float(tick.ask)-float(tick.bid))/max(float(info.point),1e-12)
+    flow=None
     try:
-        latest = mt5.copy_ticks_from(symbol, datetime.now(), 500, mt5.COPY_TICKS_ALL)
-        buy_flag = getattr(mt5, "TICK_FLAG_BUY", 8)
-        sell_flag = getattr(mt5, "TICK_FLAG_SELL", 16)
-        if latest is not None and len(latest):
-            buy = sum(1 for row in latest if int(row["flags"]) & buy_flag)
-            sell = sum(1 for row in latest if int(row["flags"]) & sell_flag)
-            total = buy + sell
-            if total:
-                tick_imbalance = (buy - sell) / total
-                # Prefer actual depth when available; otherwise use tick flags as a rough proxy.
-                if imbalance is None:
-                    imbalance = tick_imbalance
-    except Exception as exc:
-        logging.debug("%s: tick flow unavailable: %s", symbol, exc)
-    return imbalance, depth_total
+        if mt5.market_book_add(m["symbol"]):
+            book=mt5.market_book_get(m["symbol"]) or []
+            b=sum(float(x.volume) for x in book if x.type==mt5.BOOK_TYPE_BUY); a=sum(float(x.volume) for x in book if x.type==mt5.BOOK_TYPE_SELL)
+            if b+a: flow=(b-a)/(b+a)
+            mt5.market_book_release(m["symbol"])
+    except Exception: pass
+    return {"df":enriched,"price":float(tick.ask),"spread":spread,"volume_usd":float(df.tick_volume.iloc[-1]),"flow":flow,"liquidity":float(df.tick_volume.iloc[-1]),"details":{"bid":float(tick.bid),"ask":float(tick.ask),"info":info}}
 
-
-@dataclass
-class Position:
-    symbol: str
-    side: str
-    entry: float
-    stop: float
-    target: float
-    volume: float
-    risk_cash: float
-    opened_at: str
-
-
-class PaperBroker:
-    def __init__(self, cfg: dict[str, Any]):
-        self.cfg = cfg["paper"]
-        self.path = Path(self.cfg.get("state_file", "paper_state.json"))
-        self.balance = float(self.cfg["starting_balance"])
-        self.positions: dict[str, Position] = {}
-        self.day = utc_now().date().isoformat()
-        self.day_start_balance = self.balance
-        self._load()
-
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            saved = json.loads(self.path.read_text(encoding="utf-8"))
-            self.balance = float(saved.get("balance", self.balance))
-            self.day = saved.get("day", self.day)
-            self.day_start_balance = float(saved.get("day_start_balance", self.balance))
-            self.positions = {k: Position(**v) for k, v in saved.get("positions", {}).items()}
-            logging.info("Loaded paper state: balance %.2f, %d open positions", self.balance, len(self.positions))
-        except (ValueError, TypeError, OSError) as exc:
-            raise RuntimeError(f"Cannot read paper state {self.path}: {exc}") from exc
-
-    def save(self) -> None:
-        data = {"balance": self.balance, "day": self.day, "day_start_balance": self.day_start_balance,
-                "positions": {k: asdict(v) for k, v in self.positions.items()}}
-        temp = self.path.with_suffix(self.path.suffix + ".tmp")
-        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        temp.replace(self.path)
-
-    def daily_loss_limit_hit(self) -> bool:
-        today = utc_now().date().isoformat()
-        if today != self.day:
-            self.day, self.day_start_balance = today, self.balance
-            self.save()
-        max_loss = self.day_start_balance * float(self.cfg.get("max_daily_loss_pct", 2.0)) / 100
-        return self.day_start_balance - self.balance >= max_loss
-
-    def size(self, symbol_info: Any, entry: float, stop: float) -> tuple[float, float]:
-        risk_cash = self.balance * float(self.cfg["risk_per_trade_pct"]) / 100
-        tick_size = float(symbol_info.trade_tick_size or symbol_info.point or 0)
-        tick_value = float(symbol_info.trade_tick_value or 0)
-        if tick_size <= 0 or tick_value <= 0 or entry == stop:
-            return 0.0, risk_cash
-        cash_per_lot = abs(entry - stop) / tick_size * tick_value
-        if cash_per_lot <= 0:
-            return 0.0, risk_cash
-        raw = risk_cash / cash_per_lot
-        step = float(symbol_info.volume_step or 0.01)
-        minimum = float(symbol_info.volume_min or step)
-        maximum = float(symbol_info.volume_max or raw)
-        volume = min(maximum, math.floor(raw / step) * step)
-        if volume < minimum:
-            return 0.0, risk_cash
-        return round(volume, 8), risk_cash
-
-    def open(self, symbol: str, side: str, entry: float, stop: float, target: float, info: Any) -> None:
-        if symbol in self.positions or len(self.positions) >= int(self.cfg.get("max_open_positions", 3)):
-            return
-        volume, risk = self.size(info, entry, stop)
-        if volume <= 0:
-            logging.warning("%s: calculated size below broker minimum; no paper trade", symbol)
-            return
-        self.positions[symbol] = Position(symbol, side, entry, stop, target, volume, risk, utc_now().isoformat())
-        logging.info("PAPER OPEN %s %s entry=%.8f SL=%.8f TP=%.8f volume=%s risk=%.2f", symbol, side, entry, stop, target, volume, risk)
-        self._record("OPEN", symbol, side, entry, 0.0, volume, "signal")
-        self.save()
-
-    def manage(self, symbol: str, bid: float, ask: float, info: Any) -> None:
-        p = self.positions.get(symbol)
-        if p is None:
-            return
-        # Long exits execute at bid, short exits at ask; conservative fills omit slippage/fees.
-        price = bid if p.side == "BUY" else ask
-        reason = None
-        if p.side == "BUY" and price <= p.stop:
-            reason = "stop_loss"
-        elif p.side == "BUY" and price >= p.target:
-            reason = "take_profit"
-        elif p.side == "SELL" and price >= p.stop:
-            reason = "stop_loss"
-        elif p.side == "SELL" and price <= p.target:
-            reason = "take_profit"
-        if not reason:
-            return
-        tick_size = float(info.trade_tick_size or info.point or 0)
-        tick_value = float(info.trade_tick_value or 0)
-        pnl = ((price - p.entry) if p.side == "BUY" else (p.entry - price)) / tick_size * tick_value * p.volume if tick_size > 0 else 0
-        self.balance += pnl
-        logging.info("PAPER CLOSE %s %s %s exit=%.8f P/L=%.2f balance=%.2f", symbol, p.side, reason, price, pnl, self.balance)
-        self._record("CLOSE", symbol, p.side, price, pnl, p.volume, reason)
-        del self.positions[symbol]
-        self.save()
-
+class PaperAccount:
+    def __init__(self,cfg):
+        self.cfg=cfg["paper"]; self.path=Path(self.cfg.get("state_file","paper_state.json")); self.balance=float(self.cfg["starting_balance"]); self.positions={}; self.day=now().date().isoformat(); self.day_start=self.balance; self.peak=self.balance; self._load()
+        self.risk=RiskEngine(RiskLimits(risk_per_trade_pct=float(self.cfg["risk_per_trade_pct"]),max_daily_loss_pct=float(self.cfg.get("max_daily_loss_pct",2)),max_drawdown_pct=float(self.cfg.get("max_drawdown_pct",10)),max_total_risk_pct=float(self.cfg.get("max_total_risk_pct",1.5)),max_notional_pct=float(self.cfg.get("max_notional_pct",100)),max_open_positions=int(self.cfg.get("max_open_positions",3))))
+    def _load(self):
+        if self.path.exists():
+            d=json.loads(self.path.read_text(encoding="utf-8")); self.balance=float(d.get("balance",self.balance)); self.positions=d.get("positions",{}); self.day=d.get("day",self.day); self.day_start=float(d.get("day_start",self.balance)); self.peak=float(d.get("peak",self.balance))
+    def save(self):
+        data={"balance":self.balance,"positions":self.positions,"day":self.day,"day_start":self.day_start,"peak":self.peak}; tmp=self.path.with_suffix(".tmp"); tmp.write_text(json.dumps(data,indent=2),encoding="utf-8"); tmp.replace(self.path)
+    def update_day(self):
+        today=now().date().isoformat()
+        if today!=self.day: self.day=today; self.day_start=self.balance; self.save()
+    def equity_controls(self):
+        self.update_day(); self.peak=max(self.peak,self.balance)
+        open_risk=sum(float(p["risk_cash"]) for p in self.positions.values())
+        return self.risk.can_open(self.balance,self.day_start,self.peak,open_risk,len(self.positions))
+    def close_check(self,key,price):
+        p=self.positions.get(key)
+        if not p:return
+        hit=(price<=p["stop"] if p["side"]=="BUY" else price>=p["stop"]); target=(price>=p["target"] if p["side"]=="BUY" else price<=p["target"])
+        if not (hit or target):return
+        exit_price=p["stop"] if hit else p["target"]; reason="stop_loss" if hit else "take_profit"
+        pnl=(exit_price-p["entry"] if p["side"]=="BUY" else p["entry"]-exit_price)*p["units"]*p["unit_multiplier"]
+        pnl-= (p["entry"]+exit_price)*p["units"]*float(self.cfg.get("fee_rate",0.001))
+        self.balance+=pnl; self._event("CLOSE",key,p["side"],exit_price,p["units"],pnl,reason); del self.positions[key]; self.peak=max(self.peak,self.balance); self.save()
+    def open(self,key,side,price,atr,m,flow):
+        if key in self.positions:return
+        ok,reason=self.equity_controls()
+        if not ok: logging.info("Risk gate blocked %s: %s",key,reason); return
+        stop_dist=atr*float(m.get("stop_atr_multiple",2)); rr=float(m.get("reward_risk_ratio",1.5))
+        unit_multiplier=1.0
+        if m["type"]=="mt5":
+            info=None
+            # mt5 contract value approximation converted to account currency by broker metadata.
+            # Refuse sizing if tick value is unavailable rather than guess.
+            info=_latest_mt5_info.get(key)
+            if info is None or not info.trade_tick_size or not info.trade_tick_value: logging.warning("No MT5 tick-value sizing for %s; skip",key); return
+            unit_multiplier=float(info.trade_tick_value)/float(info.trade_tick_size)
+        stop=price-stop_dist if side=="BUY" else price+stop_dist; target=price+stop_dist*rr if side=="BUY" else price-stop_dist*rr
+        units,risk_cash=self.risk.size(self.balance,price,stop,unit_pnl_per_price=unit_multiplier)
+        if units<=0:return
+        pos={"symbol":m["symbol"],"market":m["type"],"side":side,"entry":price,"stop":stop,"target":target,"units":units,"risk_cash":risk_cash,"unit_multiplier":unit_multiplier,"opened_at":now().isoformat()}
+        self.positions[key]=pos; logging.info("PAPER %s %s %.8f SL %.8f TP %.8f size %.8f",side,key,price,stop,target,units); self._event("OPEN",key,side,price,units,0,"signal"); self.save()
     @staticmethod
-    def _record(event: str, symbol: str, side: str, price: float, pnl: float, volume: float, note: str) -> None:
-        file_exists = Path("trades.csv").exists()
-        pd.DataFrame([{"time_utc": utc_now().isoformat(), "event": event, "symbol": symbol,
-                       "side": side, "price": price, "pnl": pnl, "volume": volume, "note": note}]).to_csv(
-            "trades.csv", mode="a", header=not file_exists, index=False)
+    def _event(event,key,side,price,units,pnl,note):
+        append_csv("trades.csv",{"time_utc":now().isoformat(),"event":event,"market":key,"side":side,"price":price,"units":units,"pnl":pnl,"note":note})
 
+def _signal(m, data, account):
+    df=data["df"]
+    if len(df)<3:return
+    cur=df.iloc[-1]; prev=df.iloc[-2]; action="HOLD"
+    if cur.signal==1:action="BUY"
+    elif cur.signal==-1:action="SELL"
+    flow=data["flow"]
+    if flow is not None and abs(flow)<float(m.get("min_flow_imbalance",0.05)): action="HOLD"
+    if action=="BUY" and flow is not None and flow<=0: action="HOLD"
+    if action=="SELL" and flow is not None and flow>=0: action="HOLD"
+    record={"time_utc":now().isoformat(),"market":f"{m['type']}:{m['symbol']}","price":data["price"],"signal":action,"flow":flow if flow is not None else "","spread":data["spread"],"volume":data["volume_usd"],"atr":float(cur.atr) if pd.notna(cur.atr) else "","reason":"EMA crossover; book imbalance is a rough proxy"}
+    append_csv("signals.csv",record)
+    logging.info("SIGNAL %s %s price=%.8f flow=%s",record["market"],action,data["price"],flow)
+    key=record["market"]
+    account.close_check(key,data["details"].get("bid",data["price"]) if account.positions.get(key,{}).get("side")=="BUY" else data["details"].get("ask",data["price"]))
+    if action in ("BUY","SELL") and pd.notna(cur.atr) and cur.atr>0:
+        if m["type"]=="mt5": _latest_mt5_info[key]=data["details"].get("info")
+        account.open(key,action,data["price"],float(cur.atr),m,flow)
 
-def scan_symbol(symbol: str, cfg: dict[str, Any], broker: PaperBroker) -> None:
-    scanner = cfg["scanner"]
-    if not mt5.symbol_select(symbol, True):
-        logging.warning("%s: unavailable from broker (%s)", symbol, mt5.last_error())
-        return
-    result = rates_frame(symbol, scanner)
-    if result is None:
-        return
-    frame, info, tick = result
-    broker.manage(symbol, float(tick.bid), float(tick.ask), info)
-    spread_points = (float(tick.ask) - float(tick.bid)) / float(info.point or 1)
-    tick_volume = float(frame["tick_volume"].iloc[-2]) if len(frame) > 1 else 0
-    if spread_points > float(scanner.get("max_spread_points", float("inf"))):
-        logging.info("%s skipped: spread %.1f points exceeds limit", symbol, spread_points)
-        return
-    if tick_volume < float(scanner.get("min_tick_volume", 0)):
-        logging.info("%s skipped: tick volume %.0f below minimum", symbol, tick_volume)
-        return
-    flow, depth = tick_flow(symbol, cfg)
-    if cfg.get("mt5", {}).get("require_market_depth", False) and depth <= 0:
-        logging.info("%s skipped: required market depth unavailable", symbol)
-        return
-    min_depth = float(scanner.get("min_depth_volume", 0))
-    if min_depth > 0 and depth < min_depth:
-        logging.info("%s skipped: depth %.2f below minimum %.2f", symbol, depth, min_depth)
-        return
-    ind = indicators(frame.iloc[:-1], scanner)  # omit the still-forming candle from indicator decisions
-    if not math.isfinite(ind["atr"]) or ind["atr"] <= 0:
-        logging.info("%s skipped: ATR unavailable", symbol)
-        return
-    logging.info("%s close=%.8f spread=%.1f tickVol=%.0f flow=%s depth=%.2f EMA(%d/%d)=%.8f/%.8f ATR=%.8f",
-                 symbol, ind["close"], spread_points, tick_volume,
-                 "n/a" if flow is None else f"{flow:+.2f}", depth,
-                 int(scanner["ema_fast"]), int(scanner["ema_slow"]), ind["fast"], ind["slow"], ind["atr"])
-    if broker.daily_loss_limit_hit() or symbol in broker.positions:
-        return
-    min_imbalance = float(scanner.get("min_buy_sell_imbalance", 0.1))
-    if flow is None or abs(flow) < min_imbalance:
-        return
-    side = "BUY" if ind["fast"] > ind["slow"] and flow > 0 else "SELL" if ind["fast"] < ind["slow"] and flow < 0 else None
-    if side is None:
-        return
-    distance = ind["atr"] * float(scanner["stop_atr_multiple"])
-    rr = float(scanner["reward_risk_ratio"])
-    if side == "BUY":
-        entry = float(tick.ask)
-        broker.open(symbol, side, entry, entry - distance, entry + distance * rr, info)
-    else:
-        entry = float(tick.bid)
-        broker.open(symbol, side, entry, entry + distance, entry - distance * rr, info)
-
-
-def request_stop(_signum: int, _frame: Any) -> None:
-    global STOP
-    STOP = True
-
-
-def run(config_path: str) -> None:
-    cfg = load_config(config_path)
-    init_mt5(cfg)
-    broker = PaperBroker(cfg)
-    scanner = cfg["scanner"]
+_latest_mt5_info={}
+def run(cfg):
+    account=PaperAccount(cfg)
+    if any(m.get("enabled") and m["type"]=="mt5" for m in cfg["markets"]):init_mt5(cfg)
     try:
         while not STOP:
-            for symbol in scanner["symbols"]:
-                if STOP:
-                    break
+            for m in cfg["markets"]:
+                if not m.get("enabled"):continue
                 try:
-                    scan_symbol(str(symbol), cfg, broker)
-                except Exception:
-                    logging.exception("Error while scanning %s", symbol)
-            time.sleep(max(1, int(scanner.get("poll_seconds", 30))))
+                    data=fetch_mt5(m) if m["type"]=="mt5" else fetch_binance(m)
+                    if data is None:logging.warning("No data for %s:%s",m["type"],m["symbol"]); continue
+                    spread_limit=float(m.get("max_spread_points",float("inf"))) if m["type"]=="mt5" else float(m.get("max_spread_pct",float("inf")))
+                    if data["spread"]>spread_limit: logging.info("Skip %s: spread gate",m["symbol"]); continue
+                    volume_min=float(m.get("min_tick_volume",0)) if m["type"]=="mt5" else float(m.get("min_volume_usd",0))
+                    if data["volume_usd"]<volume_min: logging.info("Skip %s: volume gate",m["symbol"]); continue
+                    _signal(m,data,account)
+                except Exception:logging.exception("Error scanning %s:%s",m["type"],m["symbol"])
+            time.sleep(max(5,int(cfg.get("poll_seconds",30))))
     finally:
-        broker.save()
-        mt5.shutdown()
-        logging.info("Stopped safely; no live orders were submitted")
+        account.save()
+        if mt5 is not None:mt5.shutdown()
 
+def load_history(provider,symbol,config,limit):
+    if provider=="binance":
+        df=binance_candles(symbol,config.get("interval","1h"),min(1000,int(limit)))
+        return df.iloc[:-1].rename(columns={"open_time":"time"})
+    if mt5 is None:raise RuntimeError("Install MetaTrader5 on Windows to retrieve MT5 history")
+    if not mt5.initialize():raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+    name=str(config.get("timeframe","H1")).upper()
+    if name not in TF:raise ValueError("Unsupported MT5 timeframe")
+    if not mt5.symbol_select(symbol,True):raise RuntimeError(f"MT5 symbol not available: {symbol}")
+    raw=mt5.copy_rates_from_pos(symbol,getattr(mt5,TF[name]),1,int(limit))
+    if raw is None:raise RuntimeError(f"No MT5 historical rates for {symbol}")
+    return pd.DataFrame(raw).rename(columns={"time":"time"})
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="MT5 market scanner and paper trader (no live orders)")
-    parser.add_argument("--config", default="config.yaml", help="YAML config path (default: config.yaml)")
-    args = parser.parse_args()
-    setup_logging()
-    signal.signal(signal.SIGINT, request_stop)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, request_stop)
+def do_backtest(cfg,provider,symbol,limit,output):
+    item=next((x for x in cfg["markets"] if x["type"]==provider and x["symbol"]==symbol),{})
+    frame=load_history(provider,symbol,item,limit)
+    result=backtest(frame,initial_cash=float(cfg["paper"]["starting_balance"]),risk_pct=float(cfg["paper"]["risk_per_trade_pct"]),fast=int(item.get("trend_fast_ema",12)),slow=int(item.get("trend_slow_ema",26)),atr_period=int(item.get("atr_period",14)),stop_atr=float(item.get("stop_atr_multiple",2)),reward_risk=float(item.get("reward_risk_ratio",1.5)),fee_rate=float(cfg["paper"].get("fee_rate",0.001)),slippage=float(cfg["backtest"].get("slippage",0.0005)),max_daily_loss_pct=float(cfg["paper"].get("max_daily_loss_pct",2)),max_drawdown_pct=float(cfg["paper"].get("max_drawdown_pct",10)),max_notional_pct=float(cfg["paper"].get("max_notional_pct",100)))
+    Path(output).write_text(json.dumps(result,indent=2,default=str),encoding="utf-8")
+    print(json.dumps({k:v for k,v in result.items() if k not in {"trades","equity_curve"}},indent=2)); print(f"Full results: {output}")
+
+def request_stop(_sig,_frame):
+    global STOP; STOP=True
+
+def main():
+    p=argparse.ArgumentParser(description="Paper trading and historical backtesting for MT5/Binance")
+    p.add_argument("--config",default="config.yaml"); p.add_argument("--backtest",action="store_true"); p.add_argument("--provider",choices=["binance","mt5"]); p.add_argument("--symbol"); p.add_argument("--bars",type=int,default=1000); p.add_argument("--output",default="backtest_results.json")
+    a=p.parse_args(); log_setup()
     try:
-        run(args.config)
-    except Exception as exc:
-        logging.error("Fatal: %s", exc)
-        return 1
+        cfg=load_config(a.config)
+        if a.backtest:
+            if not a.provider or not a.symbol: p.error("--backtest needs --provider and --symbol")
+            do_backtest(cfg,a.provider,a.symbol,a.bars,a.output)
+        else:
+            signal.signal(signal.SIGINT,request_stop); run(cfg)
+    except Exception as e: logging.exception("Failed: %s",e); return 1
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__=="__main__":sys.exit(main())

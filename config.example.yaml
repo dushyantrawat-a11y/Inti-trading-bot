@@ -1,36 +1,39 @@
 paper:
   enabled: true
   starting_balance: 10000.0
-  risk_per_trade_pct: 0.5
+  risk_per_trade_pct: 0.25
   max_daily_loss_pct: 2.0
+  max_drawdown_pct: 10.0
+  max_total_risk_pct: 1.0
+  max_notional_pct: 100.0
   max_open_positions: 3
+  fee_rate: 0.001
   state_file: paper_state.json
 
-live:
-  enabled: false
-  api_base: https://api.binance.com
+backtest:
+  slippage: 0.0005
 
+poll_seconds: 30
 markets:
   - type: mt5
-    enabled: true
+    enabled: false # Review exact broker symbol, pip value and spread before enabling
     symbol: EURUSD
     timeframe: M15
-    min_spread_points: 1500
+    max_spread_points: 1500
     min_tick_volume: 10
-    min_liquidity_score: 0.15
+    min_flow_imbalance: 0.05
     trend_fast_ema: 12
     trend_slow_ema: 26
     atr_period: 14
     stop_atr_multiple: 2.0
     reward_risk_ratio: 1.5
-
   - type: binance
-    enabled: true
+    enabled: false # Review market and thresholds before enabling
     symbol: BTCUSDT
     interval: 15m
-    min_spread_pct: 0.0008
+    max_spread_pct: 0.001
     min_volume_usd: 500000
-    min_book_liquidity: 0.15
+    min_flow_imbalance: 0.05
     trend_fast_ema: 12
     trend_slow_ema: 26
     atr_period: 14

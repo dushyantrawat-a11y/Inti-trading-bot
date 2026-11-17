@@ -2,8 +2,11 @@ __pycache__/
 .venv/
 venv/
 config.yaml
+config.discovered.yaml
 .env
 paper_state.json
 bot.log
 trades.csv
+signals.csv
+backtest_results.json
 *.py[cod]
