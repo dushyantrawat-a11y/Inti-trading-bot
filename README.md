@@ -1,61 +1,39 @@
 # Trading bot upgrade: signals, backtests, risk controls, auto-discovery and dashboard
 
-This application scans reviewed MT5 and Binance symbols and simulates trades locally. **It does not place live orders.** Do not treat generated signals as financial advice.
+This repository includes an ITB pipeline scaffold and a standalone Yahoo Finance example in `trading_bot.py`. The standalone script creates EMA20/EMA50 crossover signals filtered by RSI, uses ATR-based stop/target levels, makes a historical backtest, and writes a chart. It is long-only and **paper only**; it has no live brokerage integration.
 
-## Setup
+## Yahoo signal/backtest example
 
-Python 3.10+:
+Install the optional dependencies:
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item config.example.yaml config.yaml
+```shell
+python -m pip install -r requirements-yahoo-bot.txt
 ```
 
-MT5 scanning requires Windows, the MetaTrader 5 terminal, and a broker login. Binance public market data needs network access but no API keys. For MT5 credentials, use `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, and optionally `MT5_PATH` environment variables. Never commit secrets.
+Backtest:
 
-## Buy/sell signals and paper scanner
-
-Review `config.yaml`, use exact broker symbol names, and set `enabled: true` only for markets you intend to scan. Run:
-
-```powershell
-python bot.py --config config.yaml
+```shell
+python trading_bot.py --symbol RELIANCE.NS --mode backtest --period 2y --interval 1d
 ```
 
-Signals are based on EMA crossovers; available order-book imbalance can act as a confirmation filter. MT5 order-book/tick data varies by broker, and Binance depth is a snapshot. These are imperfect proxies, not reliable predictions. Signals append to `signals.csv`; paper trade events go to `trades.csv` and state to `paper_state.json`.
+One current-data paper step (the option is named `live` for compatibility, but never sends real orders):
 
-## Historical backtesting
-
-```powershell
-python bot.py --config config.yaml --backtest --provider binance --symbol BTCUSDT --bars 1000
-python bot.py --config config.yaml --backtest --provider mt5 --symbol EURUSD --bars 5000
+```shell
+python trading_bot.py --symbol RELIANCE.NS --mode live --period 2y --interval 1d
 ```
 
-Results are written to `backtest_results.json`. The backtest enters at the next bar's open after a closed-bar EMA cross, includes configured fees/slippage, and assumes the stop is hit first if both stop and target occur within one candle. Historical results are not predictive; validate with out-of-sample data and realistic costs. Binance endpoint limits restrict maximum requested bars per call.
+The backtest enters on the next bar's open after a closed-bar signal. It models configured fee and slippage assumptions, share-sized risk (default 1%), 2×ATR stop and 3×ATR target; if both stop and target touch in one candle, stop-loss is assumed first. Results are saved to `backtest_trades.csv`, and chart to `chart.png`. Paper account state is local in `paper_state.json`; use `--state-file` to select another state file.
 
-## Risk controls
+Yahoo Finance data/availability may be delayed or incomplete. This strategy and its backtest are educational, are not financial advice, and cannot guarantee returns. Simulated performance is not live performance. Review market-specific lot sizes, taxes, costs, gaps, and execution behavior before relying on any result.
 
-`core.RiskEngine` enforces per-trade risk budget, daily loss, peak-to-trough drawdown, maximum aggregate open risk, notional cap, and open-position limit. Conservative defaults are provided. MT5 position sizing is refused if the broker does not provide usable tick-value metadata. Sizing and P/L remain approximations, especially across account currencies and contract types.
+## Existing ITB / MT5 + Binance scaffold
 
-## Auto-discover markets
+The existing pipeline and scanner material is described below. MT5 scanning requires a configured Windows terminal; market candidates must be reviewed before enabling. The project is experimental, paper-oriented, and does not guarantee profits.
 
-```powershell
-python autoconfig.py --provider both --quotes USDT,USDC --limit 100
-```
+- `bot.py`: MT5/Binance paper scanner and backtest CLI
+- `core.py`: signal and risk/backtest utilities
+- `autoconfig.py`: market candidate discovery
+- `dashboard.py`: local read-only Streamlit monitor
+- `itb/`: ITB pipeline and trainable-feature scaffolding
 
-This writes `config.discovered.yaml` with discovered candidates **disabled**. Review symbols, thresholds, permissions and costs; copy chosen entries into `config.yaml` and enable manually. MT5 discovery requires an initialized terminal. Discovery does not mean a market is suitable or liquid enough for a strategy.
-
-## Dashboard
-
-The local read-only Streamlit dashboard shows latest signals, paper positions, trade events, and latest backtest:
-
-```powershell
-streamlit run dashboard.py
-```
-
-Do not expose it to the public internet; it is intended for local use only. It reads the local CSV/JSON files and does not control the bot.
-
-## Safety
-
-Paper mode must remain enabled. Live order execution is not implemented. Paper execution does not fully model spread, partial fills, market impact, funding, exchange outages, or slippage. Stop losses can gap. This software is educational, not investment advice, and cannot guarantee returns.
+Never commit broker passwords, exchange keys, or Telegram tokens.
